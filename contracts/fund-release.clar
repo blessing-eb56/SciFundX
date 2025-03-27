@@ -1,273 +1,162 @@
-;; SciFundX: Decentralized Scientific Research Funding Platform
-;; This contract allows researchers to submit proposals, reviewers to vote, funders to support approved projects, and implement milestone-based funding
+;; SciFundX: Decentralized Scientific Research Funding
+;; This contract allows researchers to submit proposals, reviewers to vote, funders to support approved projects, and implement a refund mechanism
 
 ;; Define constants
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_NOT_AUTHORIZED (err u100))
 (define-constant ERR_INVALID_AMOUNT (err u101))
-(define-constant ERR_PROPOSAL_NOT_FOUND (err u102))
+(define-constant ERR_PROJ_NOT_FOUND (err u102))
 (define-constant ERR_ALREADY_FUNDED (err u103))
 (define-constant ERR_INVALID_TITLE (err u104))
-(define-constant ERR_INVALID_ABSTRACT (err u105))
-(define-constant ERR_INVALID_FUNDING_GOAL (err u106))
-(define-constant ERR_INVALID_PROPOSAL_ID (err u107))
+(define-constant ERR_INVALID_DESCRIPTION (err u105))
+(define-constant ERR_INVALID_FUNDING_TARGET (err u106))
+(define-constant ERR_INVALID_PROJ_ID (err u107))
 (define-constant ERR_INVALID_STATUS (err u108))
 (define-constant ERR_ALREADY_VOTED (err u109))
-(define-constant ERR_NOT_REVIEWER (err u110))
-(define-constant ERR_INVALID_REVIEWER (err u111))
-(define-constant ERR_NOT_FUNDER (err u112))
-(define-constant ERR_INVALID_MILESTONE (err u113))
-(define-constant ERR_MILESTONE_NOT_COMPLETE (err u114))
-(define-constant ERR_ALREADY_REGISTERED (err u115))
+(define-constant ERR_NOT_EVALUATOR (err u110))
+(define-constant ERR_INVALID_EVALUATOR (err u111))
+(define-constant ERR_NOT_BACKER (err u112))
+(define-constant ERR_REFUND_NOT_AVAILABLE (err u113))
 
-;; Define proposal statuses
+;; Define project statuses
 (define-constant STATUS_SUBMITTED u0)
-(define-constant STATUS_UNDER_REVIEW u1)
+(define-constant STATUS_UNDER_EVALUATION u1)
 (define-constant STATUS_APPROVED u2)
 (define-constant STATUS_REJECTED u3)
-(define-constant STATUS_OPEN_FOR_FUNDING u4)
+(define-constant STATUS_OPEN u4)
 (define-constant STATUS_FUNDED u5)
-(define-constant STATUS_COMPLETED u6)
-(define-constant STATUS_MILESTONE_REVIEW u7)
+(define-constant STATUS_CLOSED u6)
+(define-constant STATUS_REFUNDABLE u7)
 
 ;; Define vote options
 (define-constant VOTE_APPROVE u1)
 (define-constant VOTE_REJECT u0)
 
 ;; Define data maps
-(define-map proposals
-  { proposal-id: uint }
+(define-map science-projects
+  { proj-id: uint }
   {
-    researcher: principal,
+    scientist: principal,
     title: (string-ascii 100),
-    abstract: (string-ascii 1000),
-    proposal-hash: (buff 32),
-    funding-goal: uint,
+    description: (string-ascii 1000),
+    funding-target: uint,
     current-funding: uint,
     status: uint,
     approve-votes: uint,
     reject-votes: uint,
-    milestone-count: uint,
-    current-milestone: uint,
-    created-at: uint
+    deadline: uint
   }
 )
 
-(define-map fundings
-  { proposal-id: uint, funder: principal }
+(define-map project-backing
+  { proj-id: uint, backer: principal }
   { amount: uint }
 )
 
-(define-map researchers
-  { researcher: principal }
-  { 
-    name: (string-ascii 100),
-    institution: (string-ascii 100),
-    field: (string-ascii 50),
-    reputation-score: uint,
-    total-completed: uint,
-    is-active: bool 
-  }
-)
-
-(define-map reviewers
-  { reviewer: principal }
+(define-map evaluators
+  { evaluator: principal }
   { is-active: bool }
 )
 
-(define-map votes
-  { proposal-id: uint, reviewer: principal }
-  { vote: uint }
-)
-
-(define-map milestones
-  { proposal-id: uint, milestone-number: uint }
-  { 
-    percentage: uint,
-    description: (string-ascii 200),
-    is-completed: bool,
-    approve-votes: uint,
-    reject-votes: uint
-  }
-)
-
-(define-map milestone-votes
-  { proposal-id: uint, milestone-number: uint, reviewer: principal }
+(define-map evaluations
+  { proj-id: uint, evaluator: principal }
   { vote: uint }
 )
 
 ;; Define variables
-(define-data-var proposal-counter uint u0)
-(define-data-var required-votes uint u3)
-(define-data-var platform-fee uint u30) ;; 0.3% fee in basis points (30/10000)
-(define-data-var platform-treasury uint u0)
+(define-data-var project-counter uint u0)
+(define-data-var required-evaluations uint u3)
+(define-data-var funding-duration uint u43200) ;; Default to 30 days (in blocks, assuming 1 block every 60 seconds)
 
 ;; Helper functions for input validation
 (define-private (is-valid-title (title (string-ascii 100)))
   (and (> (len title) u0) (<= (len title) u100))
 )
 
-(define-private (is-valid-abstract (abstract (string-ascii 1000)))
-  (and (> (len abstract) u0) (<= (len abstract) u1000))
+(define-private (is-valid-description (description (string-ascii 1000)))
+  (and (> (len description) u0) (<= (len description) u1000))
 )
 
-(define-private (is-valid-funding-goal (funding-goal uint))
-  (> funding-goal u0)
+(define-private (is-valid-funding-target (funding-target uint))
+  (> funding-target u0)
 )
 
-(define-private (is-valid-proposal-id (proposal-id uint))
-  (<= proposal-id (var-get proposal-counter))
+(define-private (is-valid-proj-id (proj-id uint))
+  (<= proj-id (var-get project-counter))
 )
 
 (define-private (is-valid-status (status uint))
-  (and (>= status STATUS_SUBMITTED) (<= status STATUS_MILESTONE_REVIEW))
+  (and (>= status STATUS_SUBMITTED) (<= status STATUS_REFUNDABLE))
 )
 
-(define-private (is-researcher (account principal))
-  (default-to false (get is-active (map-get? researchers { researcher: account })))
-)
-
-(define-private (is-reviewer (account principal))
-  (default-to false (get is-active (map-get? reviewers { reviewer: account })))
+(define-private (is-evaluator (account principal))
+  (default-to false (get is-active (map-get? evaluators { evaluator: account })))
 )
 
 ;; Public functions
 
-;; Register as a researcher
-(define-public (register-researcher (name (string-ascii 100)) (institution (string-ascii 100)) (field (string-ascii 50)))
-  (let
-    ((researcher tx-sender))
-    (asserts! (is-none (map-get? researchers { researcher: researcher })) ERR_ALREADY_REGISTERED)
-    (map-set researchers
-      { researcher: researcher }
-      {
-        name: name,
-        institution: institution,
-        field: field,
-        reputation-score: u50, ;; Start with neutral score
-        total-completed: u0,
-        is-active: true
-      }
-    )
-    (ok true)
-  )
-)
-
-;; Submit a new research proposal
-(define-public (submit-proposal 
-    (title (string-ascii 100)) 
-    (abstract (string-ascii 1000)) 
-    (proposal-hash (buff 32)) 
-    (funding-goal uint)
-    (milestone-percentages (list 5 uint))
-    (milestone-descriptions (list 5 (string-ascii 200))))
+;; Submit a new research project
+(define-public (submit-project (title (string-ascii 100)) (description (string-ascii 1000)) (funding-target uint))
   (begin
-    (asserts! (is-researcher tx-sender) ERR_NOT_AUTHORIZED)
     (asserts! (is-valid-title title) ERR_INVALID_TITLE)
-    (asserts! (is-valid-abstract abstract) ERR_INVALID_ABSTRACT)
-    (asserts! (is-valid-funding-goal funding-goal) ERR_INVALID_FUNDING_GOAL)
-    (asserts! (> (len milestone-percentages) u0) ERR_INVALID_MILESTONE)
-    (asserts! (is-eq (len milestone-percentages) (len milestone-descriptions)) ERR_INVALID_MILESTONE)
-    (asserts! (is-eq (fold + milestone-percentages u0) u100) ERR_INVALID_MILESTONE)
-    
+    (asserts! (is-valid-description description) ERR_INVALID_DESCRIPTION)
+    (asserts! (is-valid-funding-target funding-target) ERR_INVALID_FUNDING_TARGET)
     (let
       (
-        (proposal-id (+ (var-get proposal-counter) u1))
-        (milestone-count (len milestone-percentages))
+        (proj-id (+ (var-get project-counter) u1))
+        (deadline (+ block-height (var-get funding-duration)))
       )
-      ;; Create the proposal
-      (map-set proposals
-        { proposal-id: proposal-id }
+      (map-set science-projects
+        { proj-id: proj-id }
         {
-          researcher: tx-sender,
+          scientist: tx-sender,
           title: title,
-          abstract: abstract,
-          proposal-hash: proposal-hash,
-          funding-goal: funding-goal,
+          description: description,
+          funding-target: funding-target,
           current-funding: u0,
           status: STATUS_SUBMITTED,
           approve-votes: u0,
           reject-votes: u0,
-          milestone-count: milestone-count,
-          current-milestone: u0,
-          created-at: block-height
+          deadline: deadline
         }
       )
-      
-      ;; Create all milestones
-      (map create-milestone 
-        (map unwrap-panic 
-          (map to-uint (list u0 u1 u2 u3 u4))
-        ) 
-        milestone-percentages 
-        milestone-descriptions 
-        (list proposal-id proposal-id proposal-id proposal-id proposal-id)
-      )
-      
-      ;; Increment proposal counter
-      (var-set proposal-counter proposal-id)
-      
-      ;; Update status to under review
-      (map-set proposals
-        { proposal-id: proposal-id }
-        (merge (unwrap-panic (map-get? proposals { proposal-id: proposal-id }))
-          { status: STATUS_UNDER_REVIEW }
-        )
-      )
-      
-      (ok proposal-id)
+      (var-set project-counter proj-id)
+      (ok proj-id)
     )
   )
 )
 
-;; Helper function to create a milestone
-(define-private (create-milestone (index uint) (percentage uint) (description (string-ascii 200)) (proposal-id uint))
-  (if (and (< index (len percentage)) (> percentage u0))
-    (map-set milestones
-      { proposal-id: proposal-id, milestone-number: (+ index u1) }
-      {
-        percentage: percentage,
-        description: description,
-        is-completed: false,
-        approve-votes: u0,
-        reject-votes: u0
-      }
-    )
-    false
-  )
-)
-
-;; Vote on a proposal (only for reviewers)
-(define-public (vote-on-proposal (proposal-id uint) (vote uint))
+;; Vote on a project (only for evaluators)
+(define-public (evaluate-project (proj-id uint) (vote uint))
   (begin
-    (asserts! (is-reviewer tx-sender) ERR_NOT_REVIEWER)
-    (asserts! (is-valid-proposal-id proposal-id) ERR_INVALID_PROPOSAL_ID)
+    (asserts! (is-evaluator tx-sender) ERR_NOT_EVALUATOR)
+    (asserts! (is-valid-proj-id proj-id) ERR_INVALID_PROJ_ID)
     (asserts! (or (is-eq vote VOTE_APPROVE) (is-eq vote VOTE_REJECT)) ERR_INVALID_STATUS)
     (let
       (
-        (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-        (existing-vote (map-get? votes { proposal-id: proposal-id, reviewer: tx-sender }))
+        (project (unwrap-panic (map-get? science-projects { proj-id: proj-id })))
+        (existing-vote (map-get? evaluations { proj-id: proj-id, evaluator: tx-sender }))
       )
-      (asserts! (is-eq (get status proposal) STATUS_UNDER_REVIEW) ERR_INVALID_STATUS)
+      (asserts! (is-eq (get status project) STATUS_UNDER_EVALUATION) ERR_INVALID_STATUS)
       (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
-      (map-set votes { proposal-id: proposal-id, reviewer: tx-sender } { vote: vote })
+      (map-set evaluations { proj-id: proj-id, evaluator: tx-sender } { vote: vote })
       (if (is-eq vote VOTE_APPROVE)
-        (map-set proposals { proposal-id: proposal-id }
-          (merge proposal { approve-votes: (+ (get approve-votes proposal) u1) }))
-        (map-set proposals { proposal-id: proposal-id }
-          (merge proposal { reject-votes: (+ (get reject-votes proposal) u1) }))
+        (map-set science-projects { proj-id: proj-id }
+          (merge project { approve-votes: (+ (get approve-votes project) u1) }))
+        (map-set science-projects { proj-id: proj-id }
+          (merge project { reject-votes: (+ (get reject-votes project) u1) }))
       )
       (let
         (
-          (updated-proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-          (total-votes (+ (get approve-votes updated-proposal) (get reject-votes updated-proposal)))
+          (updated-project (unwrap-panic (map-get? science-projects { proj-id: proj-id })))
+          (total-votes (+ (get approve-votes updated-project) (get reject-votes updated-project)))
         )
-        (if (>= total-votes (var-get required-votes))
-          (if (> (get approve-votes updated-proposal) (get reject-votes updated-proposal))
-            (map-set proposals { proposal-id: proposal-id }
-              (merge updated-proposal { status: STATUS_APPROVED }))
-            (map-set proposals { proposal-id: proposal-id }
-              (merge updated-proposal { status: STATUS_REJECTED }))
+        (if (>= total-votes (var-get required-evaluations))
+          (if (> (get approve-votes updated-project) (get reject-votes updated-project))
+            (map-set science-projects { proj-id: proj-id }
+              (merge updated-project { status: STATUS_APPROVED }))
+            (map-set science-projects { proj-id: proj-id }
+              (merge updated-project { status: STATUS_REJECTED }))
           )
           true
         )
@@ -277,332 +166,193 @@
   )
 )
 
-;; Open an approved proposal for funding
-(define-public (open-for-funding (proposal-id uint))
+;; Fund a research project
+(define-public (back-project (proj-id uint) (amount uint))
   (begin
-    (asserts! (is-valid-proposal-id proposal-id) ERR_INVALID_PROPOSAL_ID)
-    (let
-      (
-        (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-      )
-      (asserts! (is-eq (get researcher proposal) tx-sender) ERR_NOT_AUTHORIZED)
-      (asserts! (is-eq (get status proposal) STATUS_APPROVED) ERR_INVALID_STATUS)
-      (map-set proposals
-        { proposal-id: proposal-id }
-        (merge proposal { status: STATUS_OPEN_FOR_FUNDING })
-      )
-      (ok true)
-    )
-  )
-)
-
-;; Fund a research proposal
-(define-public (fund-proposal (proposal-id uint) (amount uint))
-  (begin
-    (asserts! (is-valid-proposal-id proposal-id) ERR_INVALID_PROPOSAL_ID)
+    (asserts! (is-valid-proj-id proj-id) ERR_INVALID_PROJ_ID)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (let
       (
-        (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-        (fee-amount (/ (* amount (var-get platform-fee)) u10000))
-        (funding-amount (- amount fee-amount))
-        (new-funding (+ (get current-funding proposal) funding-amount))
+        (project (unwrap-panic (map-get? science-projects { proj-id: proj-id })))
+        (new-funding (+ (get current-funding project) amount))
       )
-      (asserts! (is-eq (get status proposal) STATUS_OPEN_FOR_FUNDING) ERR_INVALID_STATUS)
-      (asserts! (<= new-funding (get funding-goal proposal)) ERR_INVALID_AMOUNT)
+      (asserts! (is-eq (get status project) STATUS_OPEN) ERR_INVALID_STATUS)
+      (asserts! (<= new-funding (get funding-target project)) ERR_INVALID_AMOUNT)
       (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-      
-      ;; Update platform treasury with fee
-      (var-set platform-treasury (+ (var-get platform-treasury) fee-amount))
-      
-      ;; Update proposal funding
-      (map-set proposals
-        { proposal-id: proposal-id }
-        (merge proposal {
+      (map-set science-projects
+        { proj-id: proj-id }
+        (merge project {
           current-funding: new-funding,
-          status: (if (is-eq new-funding (get funding-goal proposal)) STATUS_FUNDED STATUS_OPEN_FOR_FUNDING)
+          status: (if (is-eq new-funding (get funding-target project)) STATUS_FUNDED STATUS_OPEN)
         })
       )
-      
-      ;; Record the funding
-      (let
-        ((current-amount (default-to u0 (get amount (map-get? fundings { proposal-id: proposal-id, funder: tx-sender })))))
-        (map-set fundings
-          { proposal-id: proposal-id, funder: tx-sender }
-          { amount: (+ current-amount funding-amount) }
-        )
+      (map-set project-backing
+        { proj-id: proj-id, backer: tx-sender }
+        { amount: (+ amount (default-to u0 (get amount (map-get? project-backing { proj-id: proj-id, backer: tx-sender })))) }
       )
-      
       (ok true)
     )
   )
 )
 
-;; Submit milestone completion
-(define-public (submit-milestone-completion (proposal-id uint))
+;; Withdraw funds for a fully funded project (only by the scientist)
+(define-public (claim-funds (proj-id uint))
   (begin
-    (asserts! (is-valid-proposal-id proposal-id) ERR_INVALID_PROPOSAL_ID)
+    (asserts! (is-valid-proj-id proj-id) ERR_INVALID_PROJ_ID)
     (let
       (
-        (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-        (next-milestone (+ (get current-milestone proposal) u1))
+        (project (unwrap-panic (map-get? science-projects { proj-id: proj-id })))
       )
-      (asserts! (is-eq (get researcher proposal) tx-sender) ERR_NOT_AUTHORIZED)
-      (asserts! (is-eq (get status proposal) STATUS_FUNDED) ERR_INVALID_STATUS)
-      (asserts! (<= next-milestone (get milestone-count proposal)) ERR_INVALID_MILESTONE)
-      
-      ;; Update status to milestone review
-      (map-set proposals
-        { proposal-id: proposal-id }
-        (merge proposal { status: STATUS_MILESTONE_REVIEW })
+      (asserts! (is-eq (get scientist project) tx-sender) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status project) STATUS_FUNDED) ERR_INVALID_STATUS)
+      (try! (as-contract (stx-transfer? (get current-funding project) tx-sender (get scientist project))))
+      (map-set science-projects
+        { proj-id: proj-id }
+        (merge project { current-funding: u0, status: STATUS_CLOSED })
       )
-      
       (ok true)
     )
   )
 )
 
-;; Vote on milestone completion (only for reviewers)
-(define-public (vote-on-milestone (proposal-id uint) (vote uint))
-  (begin
-    (asserts! (is-reviewer tx-sender) ERR_NOT_REVIEWER)
-    (asserts! (is-valid-proposal-id proposal-id) ERR_INVALID_PROPOSAL_ID)
-    (asserts! (or (is-eq vote VOTE_APPROVE) (is-eq vote VOTE_REJECT)) ERR_INVALID_STATUS)
-    (let
-      (
-        (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-        (next-milestone (+ (get current-milestone proposal) u1))
-        (milestone (unwrap-panic (map-get? milestones { proposal-id: proposal-id, milestone-number: next-milestone })))
-        (existing-vote (map-get? milestone-votes { proposal-id: proposal-id, milestone-number: next-milestone, reviewer: tx-sender }))
-      )
-      (asserts! (is-eq (get status proposal) STATUS_MILESTONE_REVIEW) ERR_INVALID_STATUS)
-      (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
-      
-      ;; Record the vote
-      (map-set milestone-votes 
-        { proposal-id: proposal-id, milestone-number: next-milestone, reviewer: tx-sender } 
-        { vote: vote }
-      )
-      
-      ;; Update milestone vote counts
-      (if (is-eq vote VOTE_APPROVE)
-        (map-set milestones { proposal-id: proposal-id, milestone-number: next-milestone }
-          (merge milestone { approve-votes: (+ (get approve-votes milestone) u1) }))
-        (map-set milestones { proposal-id: proposal-id, milestone-number: next-milestone }
-          (merge milestone { reject-votes: (+ (get reject-votes milestone) u1) }))
-      )
-      
-      ;; Check if we have enough votes to make a decision
-      (let
-        (
-          (updated-milestone (unwrap-panic (map-get? milestones { proposal-id: proposal-id, milestone-number: next-milestone })))
-          (total-votes (+ (get approve-votes updated-milestone) (get reject-votes updated-milestone)))
-        )
-        (if (>= total-votes (var-get required-votes))
-          (if (> (get approve-votes updated-milestone) (get reject-votes updated-milestone))
-            (process-milestone-completion proposal-id next-milestone)
-            ;; Return to funded status if rejected
-            (map-set proposals { proposal-id: proposal-id }
-              (merge proposal { status: STATUS_FUNDED }))
-          )
-          true
-        )
-      )
-      
-      (ok true)
-    )
-  )
-)
-
-;; Process milestone completion and release funds
-(define-private (process-milestone-completion (proposal-id uint) (milestone-number uint))
-  (let
-    (
-      (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
-      (milestone (unwrap-panic (map-get? milestones { proposal-id: proposal-id, milestone-number: milestone-number })))
-      (researcher (get researcher proposal))
-      (total-funding (get current-funding proposal))
-      (payment-amount (/ (* total-funding (get percentage milestone)) u100))
-    )
-    ;; Mark milestone as completed
-    (map-set milestones
-      { proposal-id: proposal-id, milestone-number: milestone-number }
-      (merge milestone { is-completed: true })
-    )
-    
-    ;; Transfer funds to researcher
-    (try! (as-contract (stx-transfer? payment-amount tx-sender researcher)))
-    
-    ;; Update proposal status
-    (if (is-eq milestone-number (get milestone-count proposal))
-      (begin
-        ;; This was the final milestone
-        (map-set proposals
-          { proposal-id: proposal-id }
-          (merge proposal { 
-            current-milestone: milestone-number,
-            status: STATUS_COMPLETED 
-          })
-        )
-        
-        ;; Update researcher reputation
-        (let
-          (
-            (researcher-data (unwrap-panic (map-get? researchers { researcher: researcher })))
-          )
-          (map-set researchers
-            { researcher: researcher }
-            (merge researcher-data {
-              total-completed: (+ (get total-completed researcher-data) u1),
-              reputation-score: (+ (get reputation-score researcher-data) u5)
-            })
-          )
-        )
-      )
-      ;; Not the final milestone, return to funded status
-      (map-set proposals
-        { proposal-id: proposal-id }
-        (merge proposal { 
-          current-milestone: milestone-number,
-          status: STATUS_FUNDED 
-        })
-      )
-    )
-    
-    (ok true)
-  )
-)
-
-;; Administrative Functions
-
-;; Update proposal status (only by CONTRACT_OWNER)
-(define-public (update-proposal-status (proposal-id uint) (new-status uint))
+;; Update project status (only by CONTRACT_OWNER)
+(define-public (update-project-status (proj-id uint) (new-status uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (is-valid-proposal-id proposal-id) ERR_INVALID_PROPOSAL_ID)
+    (asserts! (is-valid-proj-id proj-id) ERR_INVALID_PROJ_ID)
     (asserts! (is-valid-status new-status) ERR_INVALID_STATUS)
     (let
       (
-        (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
+        (project (unwrap-panic (map-get? science-projects { proj-id: proj-id })))
       )
-      (map-set proposals
-        { proposal-id: proposal-id }
-        (merge proposal { status: new-status })
+      (map-set science-projects
+        { proj-id: proj-id }
+        (merge project { status: new-status })
       )
       (ok true)
     )
   )
 )
 
-;; Add a reviewer (only by CONTRACT_OWNER)
-(define-public (add-reviewer (reviewer principal))
+;; Add an evaluator (only by CONTRACT_OWNER)
+(define-public (add-evaluator (evaluator principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (not (is-eq reviewer CONTRACT_OWNER)) ERR_INVALID_REVIEWER)
-    (map-set reviewers { reviewer: reviewer } { is-active: true })
+    (asserts! (not (is-eq evaluator CONTRACT_OWNER)) ERR_INVALID_EVALUATOR)
+    (map-set evaluators { evaluator: evaluator } { is-active: true })
     (ok true)
   )
 )
 
-;; Remove a reviewer (only by CONTRACT_OWNER)
-(define-public (remove-reviewer (reviewer principal))
+;; Remove an evaluator (only by CONTRACT_OWNER)
+(define-public (remove-evaluator (evaluator principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (not (is-eq reviewer CONTRACT_OWNER)) ERR_INVALID_REVIEWER)
-    (map-delete reviewers { reviewer: reviewer })
+    (asserts! (not (is-eq evaluator CONTRACT_OWNER)) ERR_INVALID_EVALUATOR)
+    (map-delete evaluators { evaluator: evaluator })
     (ok true)
   )
 )
 
-;; Set required votes (only by CONTRACT_OWNER)
-(define-public (set-required-votes (new-required-votes uint))
+;; Set required evaluations (only by CONTRACT_OWNER)
+(define-public (set-required-evaluations (new-required-evaluations uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (> new-required-votes u0) ERR_INVALID_AMOUNT)
-    (var-set required-votes new-required-votes)
+    (asserts! (> new-required-evaluations u0) ERR_INVALID_AMOUNT)
+    (var-set required-evaluations new-required-evaluations)
     (ok true)
   )
 )
 
-;; Update platform fee (only by CONTRACT_OWNER)
-(define-public (update-platform-fee (new-fee uint))
+;; Set funding duration (only by CONTRACT_OWNER)
+(define-public (set-funding-duration (new-funding-duration uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (<= new-fee u500) ERR_INVALID_AMOUNT) ;; Max 5%
-    (var-set platform-fee new-fee)
+    (asserts! (> new-funding-duration u0) ERR_INVALID_AMOUNT)
+    (var-set funding-duration new-funding-duration)
     (ok true)
   )
 )
 
-;; Withdraw platform fees (only by CONTRACT_OWNER)
-(define-public (withdraw-platform-fees (amount uint))
+;; Check if a project is eligible for refund
+(define-private (is-refund-eligible (project { proj-id: uint }))
+  (let
+    (
+      (project-data (unwrap-panic (map-get? science-projects project)))
+    )
+    (or
+      (and
+        (< (get current-funding project-data) (get funding-target project-data))
+        (> block-height (get deadline project-data))
+      )
+      (is-eq (get status project-data) STATUS_CLOSED)
+    )
+  )
+)
+
+;; Request a refund for a project
+(define-public (request-refund (proj-id uint))
   (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (<= amount (var-get platform-treasury)) ERR_INVALID_AMOUNT)
-    (try! (as-contract (stx-transfer? amount tx-sender CONTRACT_OWNER)))
-    (var-set platform-treasury (- (var-get platform-treasury) amount))
-    (ok true)
+    (asserts! (is-valid-proj-id proj-id) ERR_INVALID_PROJ_ID)
+    (let
+      (
+        (project (unwrap-panic (map-get? science-projects { proj-id: proj-id })))
+        (backing (unwrap-panic (map-get? project-backing { proj-id: proj-id, backer: tx-sender })))
+      )
+      (asserts! (is-refund-eligible { proj-id: proj-id }) ERR_REFUND_NOT_AVAILABLE)
+      (asserts! (> (get amount backing) u0) ERR_NOT_BACKER)
+      (try! (as-contract (stx-transfer? (get amount backing) tx-sender tx-sender)))
+      (map-delete project-backing { proj-id: proj-id, backer: tx-sender })
+      (map-set science-projects
+        { proj-id: proj-id }
+        (merge project { 
+          current-funding: (- (get current-funding project) (get amount backing)),
+          status: STATUS_REFUNDABLE
+        })
+      )
+      (ok true)
+    )
   )
 )
 
 ;; Read-only functions
 
-;; Get proposal details
-(define-read-only (get-proposal (proposal-id uint))
-  (map-get? proposals { proposal-id: proposal-id })
+;; Get project details
+(define-read-only (get-project (proj-id uint))
+  (map-get? science-projects { proj-id: proj-id })
 )
 
-;; Get total number of proposals
-(define-read-only (get-proposal-count)
-  (var-get proposal-counter)
+;; Get total number of projects
+(define-read-only (get-project-count)
+  (var-get project-counter)
 )
 
-;; Get funding amount for a specific proposal and funder
-(define-read-only (get-funding (proposal-id uint) (funder principal))
-  (map-get? fundings { proposal-id: proposal-id, funder: funder })
+;; Get backing amount for a specific project and backer
+(define-read-only (get-backing (proj-id uint) (backer principal))
+  (map-get? project-backing { proj-id: proj-id, backer: backer })
 )
 
-;; Get milestone details
-(define-read-only (get-milestone (proposal-id uint) (milestone-number uint))
-  (map-get? milestones { proposal-id: proposal-id, milestone-number: milestone-number })
+;; Get project status
+(define-read-only (get-project-status (proj-id uint))
+  (get status (unwrap-panic (map-get? science-projects { proj-id: proj-id })))
 )
 
-;; Get researcher details
-(define-read-only (get-researcher-details (researcher principal))
-  (map-get? researchers { researcher: researcher })
+;; Check if an account is an evaluator
+(define-read-only (is-active-evaluator (account principal))
+  (is-evaluator account)
 )
 
-;; Check if account is a reviewer
-(define-read-only (is-active-reviewer (account principal))
-  (is-reviewer account)
+;; Get required evaluations
+(define-read-only (get-required-evaluations)
+  (var-get required-evaluations)
 )
 
-;; Get required votes
-(define-read-only (get-required-votes)
-  (var-get required-votes)
+;; Get funding duration
+(define-read-only (get-funding-duration)
+  (var-get funding-duration)
 )
 
-;; Get platform fee
-(define-read-only (get-platform-fee)
-  (var-get platform-fee)
-)
-
-;; Get platform treasury
-(define-read-only (get-platform-treasury)
-  (var-get platform-treasury)
-)
-
-;; Get status name
-(define-read-only (get-status-name (status uint))
-  (match status
-    STATUS_SUBMITTED "SUBMITTED"
-    STATUS_UNDER_REVIEW "UNDER_REVIEW"
-    STATUS_APPROVED "APPROVED"
-    STATUS_REJECTED "REJECTED"
-    STATUS_OPEN_FOR_FUNDING "OPEN_FOR_FUNDING"
-    STATUS_FUNDED "FUNDED"
-    STATUS_COMPLETED "COMPLETED"
-    STATUS_MILESTONE_REVIEW "MILESTONE_REVIEW"
-    "UNKNOWN"
-  )
+;; Check if a project is eligible for refund
+(define-read-only (check-refund-eligibility (proj-id uint))
+  (is-refund-eligible { proj-id: proj-id })
 )
